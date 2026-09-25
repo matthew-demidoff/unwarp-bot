@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -34,8 +35,10 @@ MESSAGE_LIMIT = 4096
 PERIODS = {"daily": 1, "weekly": 7}
 TICK_SECONDS = 30
 NIM_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+NIM_STATUS_URL = "https://integrate.api.nvidia.com/v1/status/"
+NIM_POLL_SECONDS = 2
 NIM_MAX_TOKENS = 4096
-NIM_TIMEOUT = 120
+NIM_TIMEOUT = 60
 NIM_ASK = "Write the next post."
 PLACEHOLDERS, NIM = "Placeholders", "NVIDIA NIM"
 
@@ -107,15 +110,28 @@ def describe(u):
 
 
 async def nim_chat(key, model, messages, max_tokens=NIM_MAX_TOKENS):
-    async with httpx.AsyncClient(timeout=NIM_TIMEOUT) as client:
+    deadline = time.monotonic() + NIM_TIMEOUT
+    async with httpx.AsyncClient(timeout=NIM_TIMEOUT, headers={"Authorization": f"Bearer {key}"}) as client:
         r = await client.post(
-            NIM_URL,
-            headers={"Authorization": f"Bearer {key}"},
-            json={"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 1.0},
+            NIM_URL, json={"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 1.0}
         )
+        # busy models answer 202 and have to be polled for the result
+        while r.status_code == 202:
+            if time.monotonic() > deadline:
+                raise httpx.TimeoutException("still queued")
+            await asyncio.sleep(NIM_POLL_SECONDS)
+            r = await client.get(NIM_STATUS_URL + r.headers["NVCF-REQID"])
     r.raise_for_status()
     text = r.json()["choices"][0]["message"]["content"] or ""
     return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+
+
+def nim_error(e):
+    if isinstance(e, httpx.HTTPStatusError):
+        return f"{e.response.status_code} {e.response.text[:200]}"
+    if isinstance(e, httpx.TimeoutException):
+        return f"no answer in {NIM_TIMEOUT}s"
+    return str(e) or type(e).__name__
 
 
 async def post(bot, u):
@@ -179,8 +195,11 @@ async def push_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     try:
         await post(ctx.bot, u)
-    except (TelegramError, httpx.HTTPError) as e:
-        await update.message.reply_text(f"Post failed: {e}")
+    except TelegramError as e:
+        await update.message.reply_text(f"Post failed: {e.message}")
+        return
+    except httpx.HTTPError as e:
+        await update.message.reply_text(f"NIM failed: {nim_error(e)}")
         return
     await update.message.reply_text(f"Posted. Next scheduled post: {fmt_ts(u['next_post'])}")
 
@@ -230,16 +249,14 @@ async def set_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def set_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     nim = ctx.user_data["draft"]["nim"]
     model = update.message.text.strip()
+    await update.message.reply_text(f"Checking {model}...")
     try:
         await nim_chat(nim["key"], model, [{"role": "user", "content": "hi"}], max_tokens=1)
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code in (401, 403):
+    except httpx.HTTPError as e:
+        if isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (401, 403):
             await update.message.reply_text("NIM rejected the key, send it again.")
             return KEY
-        await update.message.reply_text(f"Model doesn't work ({e.response.status_code}), send another one.")
-        return MODEL
-    except httpx.HTTPError as e:
-        await update.message.reply_text(f"Can't reach NIM: {e}")
+        await update.message.reply_text(f"Model check failed: {nim_error(e)}\nSend another model or the same one again.")
         return MODEL
 
     nim["model"] = model
@@ -376,6 +393,16 @@ async def list_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines) or "Whitelist is empty.")
 
 
+async def still_checking(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Still waiting for NIM, hold on.")
+
+
+async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
+    log.error("update failed", exc_info=ctx.error)
+    if isinstance(update, Update) and update.effective_message:
+        await update.effective_message.reply_text(f"Something broke: {ctx.error!r}")
+
+
 async def post_init(app: Application):
     app.bot_data["poster"] = asyncio.create_task(poster(app.bot))
 
@@ -395,22 +422,24 @@ def main():
             MODE: [MessageHandler(text_only, set_mode)],
             MESSAGES: [MessageHandler(text_only, add_message), CommandHandler("done", ask_images)],
             KEY: [MessageHandler(text_only, set_key)],
-            MODEL: [MessageHandler(text_only, set_model)],
+            MODEL: [MessageHandler(text_only, set_model, block=False)],
             PROMPT: [MessageHandler(text_only, set_prompt)],
             IMAGES: [MessageHandler(fresh & filters.PHOTO, add_image), CommandHandler("done", ask_chat)],
             CHAT: [MessageHandler(fresh & filters.FORWARDED | text_only, set_chat)],
             WINDOW: [MessageHandler(text_only, set_window)],
             PERIOD: [MessageHandler(text_only, set_period)],
+            ConversationHandler.WAITING: [MessageHandler(fresh, still_checking)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     ))
     app.add_handler(CommandHandler("start", start, filters=allowed))
     app.add_handler(CommandHandler("status", status, filters=allowed))
-    app.add_handler(CommandHandler("pushnow", push_now, filters=allowed))
+    app.add_handler(CommandHandler("pushnow", push_now, filters=allowed, block=False))
     app.add_handler(CommandHandler("add", add_user, filters=admin))
     app.add_handler(CommandHandler("remove", remove_user, filters=admin))
     app.add_handler(CommandHandler("users", list_users, filters=admin))
+    app.add_error_handler(on_error)
     app.run_polling()
 
 
