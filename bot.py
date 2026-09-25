@@ -8,8 +8,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import httpx
 from dotenv import load_dotenv
-from telegram import LinkPreviewOptions, Update
+from telegram import LinkPreviewOptions, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.constants import ChatMemberStatus, MessageOriginType, ParseMode
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
@@ -29,10 +30,16 @@ DENIED = (
 MAX_ITEMS = 5
 IMAGE_CHANCE = 0.7
 CAPTION_LIMIT = 1024
+MESSAGE_LIMIT = 4096
 PERIODS = {"daily": 1, "weekly": 7}
 TICK_SECONDS = 30
+NIM_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+NIM_MAX_TOKENS = 4096
+NIM_TIMEOUT = 120
+NIM_ASK = "Write the next post."
+PLACEHOLDERS, NIM = "Placeholders", "NVIDIA NIM"
 
-MESSAGES, IMAGES, CHAT, WINDOW, PERIOD = range(5)
+MODE, MESSAGES, KEY, MODEL, PROMPT, IMAGES, CHAT, WINDOW, PERIOD = range(9)
 
 log = logging.getLogger("unwarp")
 cfg = json.loads(CONFIG.read_text()) if CONFIG.exists() else {"whitelist": [], "users": {}}
@@ -89,24 +96,41 @@ def window_day(u):
 
 
 def describe(u):
+    text = f"NIM {u['nim']['model']}" if u.get("nim") else f"{len(u['messages'])} placeholders"
     return (
         f"Chat: {u['chat_title']} ({u['chat_id']})\n"
-        f"Messages: {len(u['messages'])}, images: {len(u['images'])}\n"
+        f"Text: {text}, images: {len(u['images'])}\n"
         f"Window: {hhmm(u['window'][0])}-{hhmm(u['window'][1])}\n"
         f"Every {u['period']} day(s)\n"
         f"Next post: {fmt_ts(u['next_post'])}"
     )
 
 
+async def nim_chat(key, model, messages, max_tokens=NIM_MAX_TOKENS):
+    async with httpx.AsyncClient(timeout=NIM_TIMEOUT) as client:
+        r = await client.post(
+            NIM_URL,
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 1.0},
+        )
+    r.raise_for_status()
+    text = r.json()["choices"][0]["message"]["content"] or ""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+
+
 async def post(bot, u):
-    text = random.choice(u["messages"])
+    if nim := u.get("nim"):
+        messages = [{"role": "system", "content": nim["prompt"]}, {"role": "user", "content": NIM_ASK}]
+        text, mode = (await nim_chat(nim["key"], nim["model"], messages))[:MESSAGE_LIMIT], None
+    else:
+        text, mode = random.choice(u["messages"]), ParseMode.HTML
     if u["images"] and random.random() < IMAGE_CHANCE:
         photo = random.choice(u["images"])
         if len(text) <= CAPTION_LIMIT:
-            await bot.send_photo(u["chat_id"], photo, caption=text, parse_mode=ParseMode.HTML)
+            await bot.send_photo(u["chat_id"], photo, caption=text, parse_mode=mode)
             return
         await bot.send_photo(u["chat_id"], photo)
-    await bot.send_message(u["chat_id"], text, parse_mode=ParseMode.HTML)
+    await bot.send_message(u["chat_id"], text, parse_mode=mode)
 
 
 async def poster(bot):
@@ -132,10 +156,10 @@ async def reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
-        "unWARP posts a random placeholder to your channel or group at a random time within your window.\n\n"
+        "unWARP posts a random placeholder or AI written post to your channel or group at a random time within your window.\n\n"
         "/setup - configure posts, chat and schedule\n"
         "/status - current settings\n"
-        "/pushnow - post a random message right now\n"
+        "/pushnow - post right now\n"
         "/cancel - abort setup"
     )
     if update.effective_user.id == ADMIN_ID:
@@ -155,16 +179,33 @@ async def push_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     try:
         await post(ctx.bot, u)
-    except TelegramError as e:
-        await update.message.reply_text(f"Post failed: {e.message}")
+    except (TelegramError, httpx.HTTPError) as e:
+        await update.message.reply_text(f"Post failed: {e}")
         return
     await update.message.reply_text(f"Posted. Next scheduled post: {fmt_ts(u['next_post'])}")
 
 
 async def setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["draft"] = {"messages": [], "images": []}
-    await update.message.reply_text(f"Send up to {MAX_ITEMS} placeholder messages, one per message. /done when finished.")
-    return MESSAGES
+    await update.message.reply_text(
+        "Where should post text come from?",
+        reply_markup=ReplyKeyboardMarkup([[PLACEHOLDERS, NIM]], one_time_keyboard=True, resize_keyboard=True),
+    )
+    return MODE
+
+
+async def set_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == NIM:
+        await update.message.reply_text("Send your NVIDIA NIM API key.", reply_markup=ReplyKeyboardRemove())
+        return KEY
+    if update.message.text == PLACEHOLDERS:
+        await update.message.reply_text(
+            f"Send up to {MAX_ITEMS} placeholder messages, one per message. /done when finished.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return MESSAGES
+    await update.message.reply_text(f"Pick {PLACEHOLDERS} or {NIM}.")
+    return MODE
 
 
 async def add_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -176,8 +217,43 @@ async def add_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return MESSAGES
 
 
+async def set_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["draft"]["nim"] = {"key": update.message.text.strip()}
+    await update.message.delete()
+    await update.message.reply_text(
+        "Got the key and deleted your message. Which model? Model ID from https://build.nvidia.com/models, "
+        "e.g. deepseek-ai/deepseek-v4.1-flash"
+    )
+    return MODEL
+
+
+async def set_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    nim = ctx.user_data["draft"]["nim"]
+    model = update.message.text.strip()
+    try:
+        await nim_chat(nim["key"], model, [{"role": "user", "content": "hi"}], max_tokens=1)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in (401, 403):
+            await update.message.reply_text("NIM rejected the key, send it again.")
+            return KEY
+        await update.message.reply_text(f"Model doesn't work ({e.response.status_code}), send another one.")
+        return MODEL
+    except httpx.HTTPError as e:
+        await update.message.reply_text(f"Can't reach NIM: {e}")
+        return MODEL
+
+    nim["model"] = model
+    await update.message.reply_text("Now send the system prompt, it decides what the posts are about and how they read.")
+    return PROMPT
+
+
+async def set_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["draft"]["nim"]["prompt"] = update.message.text
+    return await ask_images(update, ctx)
+
+
 async def ask_images(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.user_data["draft"]["messages"]:
+    if not ctx.user_data["draft"]["messages"] and "nim" not in ctx.user_data["draft"]:
         await update.message.reply_text("Send at least one message first.")
         return MESSAGES
     await update.message.reply_text(f"Now send up to {MAX_ITEMS} placeholder images. /done when finished (or now to skip).")
@@ -316,7 +392,11 @@ def main():
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("setup", setup, filters=allowed)],
         states={
+            MODE: [MessageHandler(text_only, set_mode)],
             MESSAGES: [MessageHandler(text_only, add_message), CommandHandler("done", ask_images)],
+            KEY: [MessageHandler(text_only, set_key)],
+            MODEL: [MessageHandler(text_only, set_model)],
+            PROMPT: [MessageHandler(text_only, set_prompt)],
             IMAGES: [MessageHandler(fresh & filters.PHOTO, add_image), CommandHandler("done", ask_chat)],
             CHAT: [MessageHandler(fresh & filters.FORWARDED | text_only, set_chat)],
             WINDOW: [MessageHandler(text_only, set_window)],
