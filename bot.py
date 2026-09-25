@@ -135,6 +135,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "unWARP posts a random placeholder to your channel or group at a random time within your window.\n\n"
         "/setup - configure posts, chat and schedule\n"
         "/status - current settings\n"
+        "/pushnow - post a random message right now\n"
         "/cancel - abort setup"
     )
     if update.effective_user.id == ADMIN_ID:
@@ -145,6 +146,19 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = cfg["users"].get(str(update.effective_user.id))
     await update.message.reply_text(describe(u) if u else "Not set up yet, use /setup")
+
+
+async def push_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = cfg["users"].get(str(update.effective_user.id))
+    if not u:
+        await update.message.reply_text("Not set up yet, use /setup")
+        return
+    try:
+        await post(ctx.bot, u)
+    except TelegramError as e:
+        await update.message.reply_text(f"Post failed: {e.message}")
+        return
+    await update.message.reply_text(f"Posted. Next scheduled post: {fmt_ts(u['next_post'])}")
 
 
 async def setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -313,6 +327,7 @@ def main():
     ))
     app.add_handler(CommandHandler("start", start, filters=allowed))
     app.add_handler(CommandHandler("status", status, filters=allowed))
+    app.add_handler(CommandHandler("pushnow", push_now, filters=allowed))
     app.add_handler(CommandHandler("add", add_user, filters=admin))
     app.add_handler(CommandHandler("remove", remove_user, filters=admin))
     app.add_handler(CommandHandler("users", list_users, filters=admin))

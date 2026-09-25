@@ -10,6 +10,6 @@ cp .env.example .env
 python bot.py
 ```
 
-`/setup` walks through everything: messages (up to 5), images (up to 5), chat, window like `10:00-18:00`, period in days (`1`, `2`, `7`, `daily`, `weekly`). `/status` shows the next post.
+`/setup` walks through everything: messages (up to 5), images (up to 5), chat, window like `10:00-18:00`, period in days (`1`, `2`, `7`, `daily`, `weekly`). `/status` shows the next post, `/pushnow` posts right away without touching the schedule.
 
 Settings are kept in `config.json`. Times are in `TZ` if set, otherwise host time.
